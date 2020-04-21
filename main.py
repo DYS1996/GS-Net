@@ -1,19 +1,26 @@
 from __future__ import print_function
+import os.path
+from sklearn.model_selection import train_test_split
 import os
 import argparse
+import glob
+import open3d as o3d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from data import ModelNet40
-from model import GSNET
+from data import ModelNet40,shapeNetTest,shapeNetTrain, snc_synth_id_to_category
+from model import GSNET, NewGSNET
 import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
 
+folderTclass = {}
+
 def _init_():
+    np.random.seed(1125)
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
     if not os.path.exists('checkpoints/'+args.exp_name):
@@ -25,20 +32,59 @@ def _init_():
     os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
 
+    for idx,fd in enumerate(glob.glob('./data/shapenet/0*')):
+        folderTclass[idx] = snc_synth_id_to_category[os.path.basename(fd)]
+        
+
 def train(args, io):
-    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
-                              batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
-                             batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    if args.dataset == 'modelnet40':
+        train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
+                                batch_size=args.batch_size, shuffle=True, drop_last=True)
+        test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
+                                batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    else:
+        pcd = np.empty((57449,2048,3),dtype=np.float32)
+        label = np.empty((57449,),dtype=np.int64)
+        i=0
+        j=0
+        for fd in glob.glob('./data/shapenet/0*'):
+            for f in os.listdir(fd):
+                pct = o3d.io.read_point_cloud(os.path.join(fd,f))
+                pcd[i] = np.asarray(pct.points)
+                label[i]=j
+                i=i+1
+            j=j+1
+
+        if i != 57449 or j != 57:
+            raise ValueError('data stat doesn\'t match')
+
+        pcd_train, pcd_test, label_train, label_test = train_test_split(pcd, label, stratify=label,random_state=2215)
+
+        train_loader = DataLoader(shapeNetTrain(p=pcd_train,label=label_train,num_points=args.num_points), num_workers=8, 
+                                batch_size=args.batch_size, shuffle=True, drop_last=True)
+
+        test_loader = DataLoader(shapeNetTest(p=pcd_test,label=label_test,num_points=args.num_points), num_workers=8, 
+                                batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
     #Try to load models
     if args.model == 'GSNET':
-        model = GSNET(args).to(device)
+        if args.dataset == 'shapenet':
+            model = GSNET(args, output_channels=57).to(device)
+        else:
+            model = GSNET(args).to(device)
+    elif args.model == 'NewGSNET':
+        print('NewGSNET!')
+        if args.dataset == 'shapenet':
+            model = NewGSNET(args, output_channels=57).to(device)
+        else:
+            model = NewGSNET(args).to(device)
     else:
         raise Exception("Not implemented")
     print(str(model))
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
     logfile.write(str(model))
 
     model = nn.DataParallel(model)
@@ -129,13 +175,55 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
-                             batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+
+    if args.dataset == 'modelnet40':
+        test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
+                                batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    else:
+        pcd = np.empty((57449,2048,3),dtype=np.float32)
+        label = np.empty((57449,),dtype=np.int64)
+        i=0
+        j=0
+        for fd in glob.glob('./data/shapenet/0*'):
+            for f in os.listdir(fd):
+                pct = o3d.io.read_point_cloud(os.path.join(fd,f))
+                pcd[i] = np.asarray(pct.points)
+                label[i]=j
+                i=i+1
+            j=j+1
+
+        if i != 57449 or j != 57:
+            raise ValueError('data stat doesn\'t match')
+
+        pcd_train, pcd_test, label_train, label_test = train_test_split(pcd, label, stratify=label, random_state=1152)
+
+        test_loader = DataLoader(shapeNetTest(p=pcd_test,label=label_test,num_points=args.num_points), num_workers=8, 
+                                batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
     #Try to load models
-    model = GSNET(args).to(device)
+    # if args.dataset == 'modelnet40':
+    #     model = GSNET(args).to(device)
+    # else:
+    #     model = GSNET(args,output_channels=57).to(device)
+
+    if args.model == 'GSNET':
+        if args.dataset == 'shapenet':
+            model = GSNET(args, output_channels=57).to(device)
+        else:
+            model = GSNET(args).to(device)
+    elif args.model == 'NewGSNET':
+        print('NewGSNET!')
+        if args.dataset == 'shapenet':
+            model = NewGSNET(args, output_channels=57).to(device)
+        else:
+            model = NewGSNET(args).to(device)
+    else:
+        raise Exception("Not implemented")
+
+
     model = nn.DataParallel(model)
     model.load_state_dict(torch.load(args.model_path))
     model = model.eval()
@@ -143,6 +231,7 @@ def test(args, io):
     count = 0.0
     test_true = []
     test_pred = []
+    cnt = 0
     for data, label in test_loader:
 
         data, label = data.to(device), label.to(device).squeeze()
@@ -150,10 +239,24 @@ def test(args, io):
         batch_size = data.size()[0]
         logits = model(data)
         preds = logits.max(dim=1)[1]
+        if cnt <= 25:
+            for index,inq in enumerate(preds.detach().cpu().numpy() != label.cpu().numpy()):
+
+                if inq:
+                    pcd = o3d.geometry.PointCloud()
+                    # print(data.cpu().permute(0,2,1).numpy()[index].shape)
+                    pcd.points = o3d.utility.Vector3dVector((data.cpu().permute(0,2,1).numpy())[index])
+                    o3d.io.write_point_cloud("./errors/gsnet/{:d}-{:s}-{:s}.ply".format(cnt,
+                        folderTclass[(preds.detach().cpu().numpy())[index]],
+                        folderTclass[(label.cpu().numpy())[index]]),
+                        pcd
+                    )
+                    cnt=cnt+1
         test_true.append(label.cpu().numpy())
         test_pred.append(preds.detach().cpu().numpy())
     test_true = np.concatenate(test_true)
     test_pred = np.concatenate(test_pred)
+    print(np.sum(test_true!=test_pred))
     test_acc = metrics.accuracy_score(test_true, test_pred)
     avg_per_class_acc = metrics.balanced_accuracy_score(test_true, test_pred)
     outstr = 'Test :: test acc: %.6f, test avg acc: %.6f'%(test_acc, avg_per_class_acc)
@@ -167,10 +270,10 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='GSNET', metavar='N',
-                        choices=['GSNET'],
+                        choices=['GSNET', 'NewGSNET'],
                         help='Model to use')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
-                        choices=['modelnet40'])
+                        choices=['modelnet40', 'shapenet'], help='dataset to be used, [modelnet40, shapenet]')
     parser.add_argument('--batch_size', type=int, default=64, metavar='batch_size',
                         help='Size of batch)')
     parser.add_argument('--test_batch_size', type=int, default=32, metavar='batch_size',

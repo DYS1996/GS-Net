@@ -168,6 +168,178 @@ def get_graph_distance(x, k=20, idx=None):
 
 
 
+class NewGSNET(nn.Module):
+    def __init__(self, args, output_channels=40):
+        super(NewGSNET, self).__init__()
+        self.args = args
+        self.k = args.k
+        
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.mybn4 = nn.BatchNorm2d(256)
+        self.mybn5 = nn.BatchNorm2d(512)
+
+        # self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(args.emb_dims)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(13, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64*4, 64, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv2d(64*4, 128, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.myconv4 = nn.Sequential(nn.Conv2d(512, 256, kernel_size=1, bias=False ),
+                                    self.mybn4,
+                                    nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.myconv5 = nn.Sequential(nn.Conv2d(1024, 512, kernel_size=1, bias=False ),
+                                    self.mybn5,
+                                    nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.conv5 = nn.Sequential(nn.Conv1d(1024, args.emb_dims, kernel_size=1, bias=False),
+                                   self.bn5,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.linear1 = nn.Linear(args.emb_dims*2, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.linear3 = nn.Linear(256, output_channels)
+
+
+
+    def GSCM(self, points, feats, k, conv, isFirstLayer=False):
+        '''
+        Geometry Similarity Connection Module
+        :param points:  points' coordinates, shape: [B, N, 3]
+        :param feats: points' feature, shape: [B, N, F]
+        :param k: the number of neighbors
+        :param conv: convolution layers
+        :return output feature: shape: [B, F, N]
+        '''    
+        if isFirstLayer:
+            x, idx_EU, idx_EI = eigen_Graph(points.permute(0,2,1).contiguous(), k=k)
+            x = first_GroupLayer(x, idx_EU, idx_EI,k=k)
+            distance = get_graph_distance(points.permute(0,2,1).contiguous(),k=k, idx = idx_EU)
+            x = torch.cat((x, distance),dim = 1)           
+        else:
+            _, idx_EU, idx_EI = eigen_Graph(points.permute(0,2,1).contiguous(), k=k)
+            x_knn_EU = GroupLayer(feats, k=k, idx=idx_EU)
+            x_knn_EI = GroupLayer(feats, k=k, idx=idx_EI)
+            x = torch.cat((x_knn_EU,x_knn_EI),dim = 1)
+        x = conv(x)            
+        x = x.max(dim=-1, keepdim=False)[0]
+        return x
+
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        num_points_1 = x.size(2)
+        # num_points_2 = int(num_points_1/2)
+        # num_points_3 = int(num_points_1/4)
+        num_points_2 = int(num_points_1*0.75)
+        num_points_3 = int(num_points_2*0.75)
+        num_points_4 = int(num_points_3*0.75)
+        num_points_5 = int(num_points_4*0.75)
+
+        ########################BLOCK1##############################
+        N1_points = x.permute(0,2,1).contiguous()
+        x1 = self.GSCM( N1_points, None, self.k, self.conv1, isFirstLayer=True)
+
+        ########################BLOCK2##############################
+        fps_id_2 = pointnet2_utils.furthest_point_sample(N1_points, num_points_2)
+        N2_points = (
+            pointnet2_utils.gather_operation(
+                N1_points.transpose(1, 2).contiguous(), fps_id_2
+            ).transpose(1, 2).contiguous())
+        x1_downSample = (
+            pointnet2_utils.gather_operation(
+                x1, fps_id_2)
+            )
+        x2 = self.GSCM( N2_points, x1_downSample, self.k, self.conv2)
+
+        ########################BLOCK3##############################
+        fps_id_3 = pointnet2_utils.furthest_point_sample(N2_points, num_points_3)
+        N3_points = (
+            pointnet2_utils.gather_operation(
+                N2_points.transpose(1, 2).contiguous(), fps_id_3
+            ).transpose(1, 2).contiguous())
+        x2_downSample = (
+            pointnet2_utils.gather_operation(
+                x2, fps_id_3)
+            )
+        x1_downSample = (
+            pointnet2_utils.gather_operation(
+                x1_downSample, fps_id_3)
+            )   
+        x3 = self.GSCM( N3_points, x2_downSample, self.k, self.conv3)
+
+        ########################BLOCK4##############################
+        fps_id_4 = pointnet2_utils.furthest_point_sample(N3_points, num_points_4)
+        N4_points = (
+            pointnet2_utils.gather_operation(
+                N3_points.transpose(1, 2).contiguous(), fps_id_4
+            ).transpose(1, 2).contiguous())
+        x3_downSample = (
+            pointnet2_utils.gather_operation(
+                x3, fps_id_4)
+            )
+        x2_downSample = (
+            pointnet2_utils.gather_operation(
+                x2_downSample, fps_id_4)
+            )   
+        x1_downSample = (
+            pointnet2_utils.gather_operation(
+                x1_downSample, fps_id_4)
+            )   
+        x4 = self.GSCM( N4_points, x3_downSample, self.k, self.myconv4)
+
+
+        ########################BLOCK5##############################
+        fps_id_5 = pointnet2_utils.furthest_point_sample(N4_points, num_points_5)
+        N5_points = (
+            pointnet2_utils.gather_operation(
+                N4_points.transpose(1, 2).contiguous(), fps_id_5
+            ).transpose(1, 2).contiguous())
+        x4_downSample = (
+            pointnet2_utils.gather_operation(
+                x4, fps_id_5)
+            )
+        x3_downSample = (
+            pointnet2_utils.gather_operation(
+                x3_downSample, fps_id_5)
+            )
+        x2_downSample = (
+            pointnet2_utils.gather_operation(
+                x2_downSample, fps_id_5)
+            )   
+        x1_downSample = (
+            pointnet2_utils.gather_operation(
+                x1_downSample, fps_id_5)
+            )   
+        x5 = self.GSCM( N5_points, x4_downSample, self.k, self.myconv5)
+
+
+        x = torch.cat((x1_downSample, x2_downSample, x3_downSample, x4_downSample, x5), dim=1)
+
+        x = self.conv5(x)
+        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size, -1)
+        x = torch.cat((x1, x2), 1)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.dp2(x)
+        x = self.linear3(x)
+        return x
+
+
 class GSNET(nn.Module):
     def __init__(self, args, output_channels=40):
         super(GSNET, self).__init__()
